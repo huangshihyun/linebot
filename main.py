@@ -1,3 +1,4 @@
+# Existing imports
 import logging
 import os
 import re
@@ -6,7 +7,6 @@ if os.getenv('API_ENV') != 'production':
     from dotenv import load_dotenv
 
     load_dotenv()
-
 
 from fastapi import FastAPI, HTTPException, Request
 from datetime import datetime
@@ -27,6 +27,7 @@ from linebot.v3.webhooks import (
 
 import uvicorn
 import requests
+from newsapi import NewsApiClient  # Import the NewsAPI client
 
 logging.basicConfig(level=os.getenv('LOG', 'WARNING'))
 logger = logging.getLogger(__file__)
@@ -50,24 +51,23 @@ async_api_client = AsyncApiClient(configuration)
 line_bot_api = AsyncMessagingApi(async_api_client)
 parser = WebhookParser(channel_secret)
 
-
 import google.generativeai as genai
 from firebase import firebase
 from utils import check_image_quake, check_location_in_message, get_current_weather, get_weather_data, simplify_data
 
-
 firebase_url = os.getenv('FIREBASE_URL')
 gemini_key = os.getenv('GEMINI_API_KEY')
-
+news_api_key = os.getenv('NEWS_API_KEY')  # Add NewsAPI key
 
 # Initialize the Gemini Pro API
 genai.configure(api_key=gemini_key)
 
+# Initialize NewsAPI client
+newsapi = NewsApiClient(api_key=news_api_key)
 
 @app.get("/health")
 async def health():
     return 'ok'
-
 
 @app.post("/webhooks/line")
 async def handle_callback(request: Request):
@@ -101,7 +101,6 @@ async def handle_callback(request: Request):
         chatgpt = fdb.get(user_chat_path, None)
 
         if msg_type == 'text':
-
             if chatgpt is None:
                 messages = []
             else:
@@ -112,7 +111,7 @@ async def handle_callback(request: Request):
                 "摘要": 'B',
                 "地震": 'C',
                 "氣候": 'D',
-                "其他": 'E'
+                "新聞": 'E'  # Add a new condition for news
             }
 
             model = genai.GenerativeModel('gemini-1.5-pro')
@@ -131,9 +130,6 @@ async def handle_callback(request: Request):
                     f'Summary the following message in Traditional Chinese by less 5 list points. \n{messages}')
                 reply_msg = response.text
             elif text_condition == 'C':
-                print('='*10)
-                print("地震相關訊息")
-                print('='*10)
                 model = genai.GenerativeModel('gemini-pro-vision')
                 OPEN_API_KEY = os.getenv('OPEN_API_KEY')
                 earth_res = requests.get(f'https://opendata.cwa.gov.tw/fileapi/v1/opendataapi/E-A0015-003?Authorization={OPEN_API_KEY}&downloadType=WEB&format=JSON')
@@ -142,12 +138,9 @@ async def handle_callback(request: Request):
             elif text_condition == 'D':
                 location_text = '台北市'
                 location = check_location_in_message(location_text)
-                print('Location is: ' + location)
                 weather_data = get_weather_data(location)
                 simplified_data = simplify_data(weather_data)
                 current_weather = get_current_weather(simplified_data)
-
-                print('The Data is: ' + str(current_weather))
 
                 now = datetime.now()
                 formatted_time = now.strftime("%Y/%m/%d %H:%M:%S")
@@ -158,13 +151,24 @@ async def handle_callback(request: Request):
                 response = model.generate_content(
                     f'你現在身處在台灣，相關資訊 {total_info}，我朋友說了「{text}」，請問是否有誇張、假裝的嫌疑？ 回答是或否。')
                 reply_msg = response.text
-            # model = genai.GenerativeModel('gemini-pro')
+            elif text_condition == 'E':
+                # Process the news query
+                news_response = newsapi.get_top_headlines(q=text, language='zh', page_size=5)
+                articles = news_response['articles']
+                if articles:
+                    reply_msg = '以下是相關的新聞：\n'
+                    for article in articles:
+                        title = article['title']
+                        url = article['url']
+                        reply_msg += f'{title}\n{url}\n\n'
+                else:
+                    reply_msg = '未找到相關的新聞。'
+
             messages.append({'role': 'user', 'parts': [text]})
             response = model.generate_content(messages)
             messages.append({'role': 'model', 'parts': [text]})
             # 更新firebase中的對話紀錄
             fdb.put_async(user_chat_path, None, messages)
-            reply_msg = response.text
 
             await line_bot_api.reply_message(
                 ReplyMessageRequest(
