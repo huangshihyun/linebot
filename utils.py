@@ -1,14 +1,161 @@
 import os
+import logging
+import re
+import sys
+from fastapi import FastAPI, HTTPException, Request
+from datetime import datetime
+from linebot.v3.webhook import WebhookParser
+from linebot.v3.messaging import (
+    AsyncApiClient,
+    AsyncMessagingApi,
+    Configuration,
+    ReplyMessageRequest,
+    TextMessage)
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
+import uvicorn
 import requests
+from newsapi import NewsApiClient
 from PIL import Image
 from io import BytesIO
 import google.generativeai as genai
 
-import re
-from datetime import datetime
+logging.basicConfig(level=os.getenv('LOG', 'WARNING'))
+logger = logging.getLogger(__file__)
+
+app = FastAPI()
+
+channel_secret = os.getenv('LINE_CHANNEL_SECRET', None)
+channel_access_token = os.getenv('LINE_CHANNEL_ACCESS_TOKEN', None)
+if channel_secret is None:
+    print('Specify LINE_CHANNEL_SECRET as environment variable.')
+    sys.exit(1)
+if channel_access_token is None:
+    print('Specify LINE_CHANNEL_ACCESS_TOKEN as environment variable.')
+    sys.exit(1)
+
+configuration = Configuration(access_token=channel_access_token)
+async_api_client = AsyncApiClient(configuration)
+line_bot_api = AsyncMessagingApi(async_api_client)
+parser = WebhookParser(channel_secret)
+
+firebase_url = os.getenv('FIREBASE_URL')
+gemini_key = os.getenv('GEMINI_API_KEY')
+news_api_key = os.getenv('NEWS_API_KEY')
+
+genai.configure(api_key=gemini_key)
+newsapi = NewsApiClient(api_key=news_api_key)
+
+@app.get("/health")
+async def health():
+    return 'ok'
+
+@app.post("/webhooks/line")
+async def handle_callback(request: Request):
+    signature = request.headers['X-Line-Signature']
+
+    body = await request.body()
+    body = body.decode()
+
+    try:
+        events = parser.parse(body, signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    for event in events:
+        logging.info(event)
+        if not isinstance(event, MessageEvent):
+            continue
+        if not isinstance(event.message, TextMessageContent):
+            continue
+
+        text = event.message.text
+        user_id = event.source.user_id
+        msg_type = event.message.type
+
+        fdb = firebase.FirebaseApplication(firebase_url, None)
+        user_chat_path = f'chat/{event.source.group_id}' if event.source.type == 'group' else f'chat/{user_id}'
+        chatgpt = fdb.get(user_chat_path, None)
+
+        if msg_type == 'text':
+            messages = [] if chatgpt is None else chatgpt
+
+            bot_condition = {
+                "清空": 'A',
+                "摘要": 'B',
+                "地震": 'C',
+                "氣候": 'D',
+                "新聞": 'E'
+            }
+
+            model = genai.GenerativeModel('gemini-1.5-pro')
+            response = model.generate_content(
+                f'請判斷 {text} 裡面的文字屬於 {bot_condition} 裡面的哪一項？符合條件請回傳對應的英文文字就好，不要有其他的文字與字元。')
+            text_condition = re.sub(r'[^A-Za-z]', '', response.text)
+
+            if text_condition == 'A':
+                fdb.delete(user_chat_path, None)
+                reply_msg = '已清空對話紀錄'
+            elif text_condition == 'B':
+                model = genai.GenerativeModel('gemini-pro')
+                response = model.generate_content(
+                    f'Summary the following message in Traditional Chinese by less 5 list points. \n{messages}')
+                reply_msg = response.text
+            elif text_condition == 'C':
+                model = genai.GenerativeModel('gemini-pro-vision')
+                OPEN_API_KEY = os.getenv('OPEN_API_KEY')
+                earth_res = requests.get(f'https://opendata.cwa.gov.tw/fileapi/v1/opendataapi/E-A0015-003?Authorization={OPEN_API_KEY}&downloadType=WEB&format=JSON')
+                url = earth_res.json()["cwaopendata"]["Dataset"]["Resource"]["ProductURL"]
+                reply_msg = check_image_quake(url)+f'\n\n{url}'
+            elif text_condition == 'D':
+                location_text = '台北市'
+                location = check_location_in_message(location_text)
+                weather_data = get_weather_data(location)
+                simplified_data = simplify_data(weather_data)
+                current_weather = get_current_weather(simplified_data)
+
+                now = datetime.now()
+                formatted_time = now.strftime("%Y/%m/%d %H:%M:%S")
+
+                if current_weather is not None:
+                    total_info = f'位置: {location}\n氣候: {current_weather["Wx"]}\n降雨機率: {current_weather["PoP"]}\n體感: {current_weather["CI"]}\n現在時間: {formatted_time}'
+
+                response = model.generate_content(
+                    f'你現在身處在台灣，相關資訊 {total_info}，我朋友說了「{text}」，請問是否有誇張、假裝的嫌疑？ 回答是或否。')
+                reply_msg = response.text
+            elif text_condition == 'E':
+                news_response = newsapi.get_top_headlines(q=text, language='zh', page_size=5)
+                articles = news_response['articles']
+                if articles:
+                    reply_msg = '以下是相關的新聞：\n'
+                    for article in articles:
+                        title = article['title']
+                        url = article['url']
+                        reply_msg += f'{title}\n{url}\n\n'
+                else:
+                    reply_msg = '未找到相關的新聞。'
+
+            messages.append({'role': 'user', 'parts': [text]})
+            response = model.generate_content(messages)
+            messages.append({'role': 'model', 'parts': [response.text]})
+            fdb.put_async(user_chat_path, None, messages)
+
+            await line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_msg)]
+                ))
+
+    return 'OK'
+
+if __name__ == "__main__":
+    port = int(os.environ.get('PORT', default=8080))
+    debug = True if os.environ.get('API_ENV', default='develop') == 'develop' else False
+    logging.info('Application will start...')
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=debug)
 
 
-def check_image_quake(url="https://github.com/louis70109/ideas-tree/blob/master/images/%E5%8F%B0%E5%8C%97_%E5%A4%A7%E7%9B%B4%E7%BE%8E%E5%A0%A4%E6%A5%B5%E9%99%90%E5%85%AC%E5%9C%92/default.png"):
+def check_image_quake(url):
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
     response = requests.get(url)
@@ -32,9 +179,7 @@ def get_weather_data(location):
         "format": "JSON",
         "locationName": location
     }
-    headers = {
-        "accept": "application/json"
-    }
+    headers = {"accept": "application/json"}
 
     response = requests.get(url, params=params, headers=headers)
     data = response.json()
@@ -46,14 +191,11 @@ def simplify_data(data):
     location_data = data['records']['location'][0]
     weather_elements = location_data['weatherElement']
 
-    simplified_data = {
-        'location': location_data['locationName'],
-    }
+    simplified_data = {'location': location_data['locationName']}
 
     for element in weather_elements:
         element_name = element['elementName']
         for time in element['time']:
-
             start_time = time['startTime']
             if start_time not in simplified_data:
                 simplified_data[start_time] = {}
@@ -74,24 +216,18 @@ def simplify_data(data):
 
 def get_current_weather(simplified_data):
     try:
-        # 獲取當前的日期和時間
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # 遍歷所有的時間段
         for start_time in simplified_data:
             if start_time == 'location':
                 continue
             for end_time in simplified_data[start_time]:
-                # 如果當前時間在這個時間段內，則返回對應的天氣資訊
                 if start_time <= now <= end_time:
                     return simplified_data[start_time][end_time]
                 else:
-                    # 如果沒有找到符合的時間段，則返回第一個天氣資訊
                     return simplified_data[start_time][end_time]
     except Exception as e:
         print(f"An error occurred: {e}")
 
-    # 如果沒有找到任何天氣資訊，則返回None
     return None
 
 
@@ -104,14 +240,8 @@ def check_location_in_message(message):
         "臺東縣", "澎湖縣"
     ]
 
-    # 將訊息中的 "台" 替換為 "臺"
     corrected_message = re.sub("台", "臺", message)
-    local = corrected_message.split("_")
-
     for location in locations:
-        if re.search(local[0], location):
+        if re.search(corrected_message, location):
             return location
-        else:
-            location
-
     return locations[0]
